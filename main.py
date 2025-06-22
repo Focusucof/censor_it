@@ -5,9 +5,9 @@ EXTENDED_LOGGING = False
 WRITE_TO_KEYBOARD_INTERVAL = 0.002
 
 # Audio censoring configuration
-AUDIO_BUFFER_DURATION = 2.0  # Buffer duration in seconds to allow for transcription delay
-CENSOR_BEEP_FREQUENCY = 800  # Frequency of censor beep in Hz
-CENSOR_BEEP_DURATION = 0.3   # Duration of censor beep in seconds
+AUDIO_BUFFER_DURATION = 2.8  # Increased buffer for better censoring accuracy at the cost of a slight delay
+CENSOR_BEEP_FREQUENCY = 1000  # Frequency of censor beep in Hz
+CENSOR_BEEP_DURATION = 0.1   # Duration of censor beep in seconds
 
 # Common swear words list (can be expanded)
 SWEAR_WORDS = {
@@ -22,6 +22,9 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Start the realtime Speech-to-Text (STT) test with various configuration options.')
 
+    parser.add_argument('--list-devices', action='store_true',
+                        help='List available audio devices and exit.')
+
     parser.add_argument('-m', '--model', type=str, # no default='large-v2',
                         help='Path to the STT model or model size. Options include: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, or any huggingface CTranslate2 STT model such as deepdml/faster-whisper-large-v3-turbo-ct2. Default is large-v2.')
 
@@ -33,6 +36,13 @@ if __name__ == '__main__':
     
     parser.add_argument('-d', '--root', type=str, # no default=None,
                 help='Root directory where the Whisper models are downloaded to.')
+
+    parser.add_argument('--input-device', type=int, default=None,
+                        help='Index of the input device to use for transcription.')
+    parser.add_argument('--output-device', type=int, default=None,
+                        help='Index of the output device to use for audio playback.')
+
+    args = parser.parse_args()
 
     # from install_packages import check_and_install_packages
     # check_and_install_packages([
@@ -70,6 +80,11 @@ if __name__ == '__main__':
     from collections import deque
     import re
 
+    if args.list_devices:
+        print("Available audio devices:")
+        print(sd.query_devices())
+        sys.exit(0)
+
     if os.name == "nt" and (3, 8) <= sys.version_info < (3, 99):
         from torchaudio._extension.utils import _init_dll_path
         _init_dll_path()    
@@ -84,10 +99,11 @@ if __name__ == '__main__':
     rich_text_stored = ""
     recorder = None
     displayed_text = ""  # Used for tracking text that was already displayed
+    processed_for_censoring_text = "" # Tracks text processed for censoring
 
-    end_of_sentence_detection_pause = 0.45
-    unknown_sentence_detection_pause = 0.7
-    mid_sentence_detection_pause = 2.0
+    end_of_sentence_detection_pause = 0.2
+    unknown_sentence_detection_pause = 0.5
+    mid_sentence_detection_pause = 0.5
 
     # Audio censoring variables
     censor_segments = []  # List of (start_time, end_time) tuples for segments to censor
@@ -117,14 +133,25 @@ if __name__ == '__main__':
         
         return text
 
+    def censor_swear_words_in_text(text):
+        """Replaces swear words in text with asterisks."""
+        pattern = r"\b[\w']+\b"
+        
+        def replace_swear(match):
+            word = match.group(0)
+            if word.lower() in SWEAR_WORDS:
+                return '*' * len(word)
+            return word
+            
+        return re.sub(pattern, replace_swear, text)
+
     def contains_swear_words(text):
         """Check if text contains any swear words"""
         if not text:
             return False
         
-        # Convert to lowercase and remove punctuation for comparison
-        text_lower = re.sub(r'[^\w\s]', '', text.lower())
-        words = text_lower.split()
+        # Fixed to correctly tokenize words, including those with apostrophes.
+        words = re.findall(r"\b[\w']+\b", text.lower())
         
         for word in words:
             if word in SWEAR_WORDS:
@@ -134,12 +161,31 @@ if __name__ == '__main__':
     def generate_censor_beep(duration, frequency, sample_rate):
         """Generate a beep sound for censoring"""
         t = np.linspace(0, duration, int(sample_rate * duration), False)
-        beep = np.sin(2 * np.pi * frequency * t) * 0.3  # 0.3 amplitude to avoid clipping
+        beep = np.sin(2 * np.pi * frequency * t) * 0.005  # 0.3 amplitude to avoid clipping
         return beep.astype(np.float32)
 
     def text_detected(text):
-        global prev_text, displayed_text, rich_text_stored, last_transcription_time, transcription_buffer, buffer_start_time
+        global prev_text, displayed_text, rich_text_stored, last_transcription_time, transcription_buffer, buffer_start_time, censor_segments, processed_for_censoring_text
 
+        # CENSORING LOGIC MOVED HERE FOR REAL-TIME RESPONSE
+        # Determine the new text that has been transcribed since the last call
+        new_text_fragment = text
+        if text.startswith(processed_for_censoring_text):
+            new_text_fragment = text[len(processed_for_censoring_text):]
+
+        if new_text_fragment and contains_swear_words(new_text_fragment):
+            current_time = time.time() - buffer_start_time
+            # Estimate duration of the new text fragment.
+            estimated_duration = len(new_text_fragment.split()) / 2.5
+            text_start_time = current_time - estimated_duration
+
+            # Censor the time range where the new fragment was likely spoken
+            # Add a small buffer on both ends to be safe
+            censor_segments.append((text_start_time - 0.3, current_time + 0.3))
+
+        processed_for_censoring_text = text # Update the tracker
+
+        # VISUAL DISPLAY LOGIC
         text = preprocess_text(text)
 
         # Record timing for this transcription update
@@ -167,17 +213,16 @@ if __name__ == '__main__':
         # Build Rich Text with alternating colors and censoring indicators
         rich_text = Text()
         for i, sentence in enumerate(full_sentences):
+            censored_sentence = censor_swear_words_in_text(sentence)
             if i % 2 == 0:
-                rich_text += Text(sentence, style="yellow") + Text(" ")
+                rich_text += Text(censored_sentence, style="yellow") + Text(" ")
             else:
-                rich_text += Text(sentence, style="cyan") + Text(" ")
+                rich_text += Text(censored_sentence, style="cyan") + Text(" ")
         
         # If the current text is not a sentence-ending, display it in real-time
         if text:
-            if contains_swear_words(text):
-                rich_text += Text(text, style="bold red")
-            else:
-                rich_text += Text(text, style="bold yellow")
+            censored_text = censor_swear_words_in_text(text)
+            rich_text += Text(censored_text, style="bold yellow")
 
         new_displayed_text = rich_text.plain
 
@@ -188,11 +233,11 @@ if __name__ == '__main__':
             rich_text_stored = rich_text
 
     def process_text(text):
-        words = text.split()
-        for i in words:
-            pass
+        global recorder, full_sentences, prev_text
 
-        global recorder, full_sentences, prev_text, censor_segments, transcription_buffer, buffer_start_time
+        # This function now only handles finalized sentences for keyboard output
+        # and maintaining the list of full sentences.
+        # Real-time censoring is handled in `text_detected`.
 
         recorder.post_speech_silence_duration = unknown_sentence_detection_pause
 
@@ -204,45 +249,35 @@ if __name__ == '__main__':
         if not text:
             return
 
-        # Check for swear words and add to censor segments
-        if contains_swear_words(text):
-            current_time = time.time() - buffer_start_time
-            # Estimate the time range for this text segment
-            # Assume average speaking rate of 150 words per minute
-            estimated_duration = len(text.split()) / 2.5  # seconds
-            censor_segments.append((current_time - estimated_duration, current_time))
-            console.print(f"[bold red]CENSORED: {text}[/bold red]")
-
         full_sentences.append(text)
         prev_text = ""
-        text_detected("")
+        text_detected("") # Update display to show the sentence has been finalized
 
         if WRITE_TO_KEYBOARD_INTERVAL:
-            pyautogui.write(f"{text} ", interval=WRITE_TO_KEYBOARD_INTERVAL)  # Adjust interval as needed
+            censored_text = censor_swear_words_in_text(text)
+            pyautogui.write(f"{censored_text} ", interval=WRITE_TO_KEYBOARD_INTERVAL)
 
     # Recorder configuration
     recorder_config = {
         'spinner': False,
-        'model': 'large-v2', # or large-v2 or deepdml/faster-whisper-large-v3-turbo-ct2 or ...
-        'download_root': None, # default download root location. Ex. ~/.cache/huggingface/hub/ in Linux
-        # 'input_device_index': 1,
-        'realtime_model_type': 'tiny.en', # or small.en or distil-small.en or ...
+        'model': 'tiny.en',
+        'device': 'cuda',
+        'compute_type': 'auto', # Changed from float16 to auto to let the library decide the best compute type for the hardware.
+        'download_root': None,
+        'realtime_model_type': 'tiny.en',
         'language': 'en',
-        'silero_sensitivity': 0.05,
-        'webrtc_sensitivity': 3,
-        'post_speech_silence_duration': unknown_sentence_detection_pause,
-        'min_length_of_recording': 1.1,        
-        'min_gap_between_recordings': 0,                
+        'silero_sensitivity': 0.3, # Lowered for higher sensitivity to speech
+        'webrtc_sensitivity': 1,
+        'post_speech_silence_duration': 0.01, # Lowered for faster response
+        'min_length_of_recording': 0.02, # Lowered for faster response
+        'min_gap_between_recordings': 0,
         'enable_realtime_transcription': True,
-        'realtime_processing_pause': 0.02,
+        'realtime_processing_pause': 0.05,
         'on_realtime_transcription_update': text_detected,
-        #'on_realtime_transcription_stabilized': text_detected,
-        'silero_deactivity_detection': True,
-        'early_transcription_on_silence': 0,
-        'beam_size': 5,
-        'beam_size_realtime': 3,
-        # 'batch_size': 0,
-        # 'realtime_batch_size': 0,        
+        'silero_deactivity_detection': False,
+        'early_transcription_on_silence': 0.1, # Lowered for faster transcription on silence
+        'beam_size': 1, # Set to 1 for greedy decoding, which is the fastest.
+        'beam_size_realtime': 1, # Set to 1 for greedy decoding, which is the fastest for real-time.
         'no_log_file': True,
         'initial_prompt_realtime': (
             "End incomplete sentences with ellipses.\n"
@@ -256,7 +291,6 @@ if __name__ == '__main__':
         'faster_whisper_vad_filter': False,
     }
 
-    args = parser.parse_args()
     if args.model is not None:
         recorder_config['model'] = args.model
         print(f"Argument 'model' set to {recorder_config['model']}")
@@ -269,6 +303,9 @@ if __name__ == '__main__':
     if args.root is not None:
         recorder_config['download_root'] = args.root
         print(f"Argument 'download_root' set to {recorder_config['download_root']}")
+    if args.input_device is not None:
+        recorder_config['input_device_index'] = args.input_device
+        print(f"Argument 'input_device' set to {recorder_config['input_device_index']}")
 
     if EXTENDED_LOGGING:
         recorder_config['level'] = logging.DEBUG
@@ -286,33 +323,46 @@ if __name__ == '__main__':
     audio_buffer = deque(maxlen=int(SAMPLE_RATE * AUDIO_BUFFER_DURATION / CHUNK_SIZE))
 
     def should_censor_audio():
-        """Check if current audio should be censored based on recent transcriptions"""
-        current_time = time.time() - buffer_start_time
+        """Check if the audio about to be played should be censored."""
+        # The audio being played was recorded AUDIO_BUFFER_DURATION seconds ago.
+        # We calculate the time range for the audio chunk that is about to be played.
+        playback_time = (time.time() - buffer_start_time) - AUDIO_BUFFER_DURATION
+        chunk_duration = CHUNK_SIZE / SAMPLE_RATE
+        
+        # Check if the time interval of this playback chunk overlaps with any censor segment.
         for start_time, end_time in censor_segments:
-            if start_time <= current_time <= end_time:
+            # If the playback interval [playback_time, playback_time + chunk_duration]
+            # overlaps with the censor interval [start_time, end_time], then censor.
+            if max(start_time, playback_time) < min(end_time, playback_time + chunk_duration):
                 return True
         return False
 
     def audio_callback(indata, outdata, frames, time, status):
-        # Add current audio to buffer
+        # Add current audio to the end of the buffer
         audio_buffer.append(indata.copy())
         
-        # Get the audio to output (with delay for censoring)
-        if len(audio_buffer) > 0:
-            output_audio = audio_buffer.popleft()
+        # If the buffer isn't full yet, play silence. This creates the delay needed for transcription.
+        if len(audio_buffer) < audio_buffer.maxlen:
+            output_audio = np.zeros_like(indata)
         else:
-            output_audio = indata.copy()
+            # Once the buffer is full, start playing the delayed audio from the start of the buffer.
+            output_audio = audio_buffer.popleft()
         
-        # Check if we should censor this audio
+        # Check if the audio we are about to play should be censored
         if should_censor_audio():
-            output_audio.fill(0)  # Replace with silence
+            beep_duration = frames / SAMPLE_RATE
+            beep = generate_censor_beep(beep_duration, CENSOR_BEEP_FREQUENCY, SAMPLE_RATE)
+            beep_int16 = (beep * 32767).astype(np.int16)
+            # Reshape to match the expected output shape (frames, channels)
+            output_audio = beep_int16.reshape(-1, 1)
         
         # Output the audio
         outdata[:] = output_audio
 
     def run_audio_stream():
         with sd.Stream(samplerate=SAMPLE_RATE, channels=1, dtype='int16',
-                       blocksize=CHUNK_SIZE, callback=audio_callback):
+                       blocksize=CHUNK_SIZE, callback=audio_callback,
+                       device=(args.input_device, args.output_device)):
             print("Mic audio is being played through speakers with censoring. Press Ctrl+C to stop.")
             try:
                 while True:
